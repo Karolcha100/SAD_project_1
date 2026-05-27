@@ -1,0 +1,726 @@
+# ---
+title: "Analiza Pingwinów Palmer Archipelago"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+---
+
+Dane: [Palmer Archipelago Antarctica Penguin Data (Kaggle)](https://www.kaggle.com/datasets/parulpandey/palmer-archipelago-antarctica-penguin-data)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(GGally)       # ggpairs (odpowiednik sns.pairplot)
+library(patchwork)    # składanie wykresów
+library(scales)
+library(boot)         # bootstrap
+library(nortest)      # anderson.darling.test (lilliefors)
+library(corrplot)
+
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+---
+
+# Wczytywanie i wstępne obrabianie danych
+
+```{r load-data}
+df_raw <- read_csv("penguins_lter.csv")
+df_raw
+```
+
+```{r preprocess}
+df_processed <- df_raw %>%
+  dplyr::select(-studyName, -Stage, -Region, -`Sample Number`, -Comments) %>%
+  drop_na()
+
+df_processed
+```
+
+```{r clean-species}
+df_processed <- df_processed %>%
+  mutate(Species = str_remove(Species, " [Pp]enguin[\\w ()]*"))
+
+df_processed
+```
+
+```{r parse-date}
+df_processed <- df_processed %>%
+  mutate(`Date Egg` = as.Date(`Date Egg`))
+
+df_processed
+```
+
+```{r reorder-cols}
+first_variables <- c("Individual ID", "Species", "Island",
+                     "Clutch Completion", "Sex", "Date Egg")
+
+df <- df_processed %>%
+  select(all_of(first_variables),
+         everything()) %>%
+  filter(Sex != ".")
+
+df
+```
+
+```{r define-vars}
+categorical_variables <- c("Species", "Island", "Clutch Completion", "Sex")
+
+numerical_variables <- c(
+  "Culmen Length (mm)",
+  "Culmen Depth (mm)",
+  "Flipper Length (mm)",
+  "Body Mass (g)",
+  "Delta 15 N (o/oo)",
+  "Delta 13 C (o/oo)"
+)
+```
+
+---
+
+# Wizualizacja Danych (przed obróbką)
+
+### Bonus: Wykresy Kropkowe (z KDE)
+
+```{r pairplots, fig.height=10, fig.width=10}
+for (cat_var in categorical_variables) {
+  p <- ggpairs(
+    df %>% select(all_of(numerical_variables), all_of(cat_var)),
+    aes(color = .data[[cat_var]], alpha = 0.6),
+    upper = list(continuous = "density"),
+    lower = list(continuous = "points"),
+    diag  = list(continuous = "densityDiag")
+  ) +
+    labs(title = paste("Pairplot względem:", cat_var)) +
+    theme_minimal()
+  print(p)
+}
+```
+
+Z wykresów kropkowych wspomaganych KDE widzimy, że główne różnice między pingwinami przebiegają między gatunkiem (`Species`) oraz płcią (`Sex`).
+
+---
+
+## Zmienne Ilościowe
+
+```{r helper-long}
+# Pomocnicza funkcja: dane do formatu długiego dla wybranych zmiennych
+df_long <- df %>%
+  select(all_of(c(numerical_variables, categorical_variables))) %>%
+  pivot_longer(cols = all_of(numerical_variables),
+               names_to = "variable", values_to = "value")
+```
+
+### Histogramy
+
+```{r histograms}
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 25, fill = "steelblue", color = "white") +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank()) +
+  labs(title = "Histogramy zmiennych ilościowych")
+```
+
+### Dystrybuanty Empiryczne (ECDF)
+
+```{r ecdf}
+ggplot(df_long, aes(x = value)) +
+  stat_ecdf(color = "steelblue") +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Dystrybuanty Empiryczne zmiennych ilościowych")
+```
+
+### Wykresy Wiolinowe
+
+```{r violin-plain, fig.height=8}
+ggplot(df_long, aes(x = variable, y = value)) +
+  geom_violin(fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank()) +
+  labs(title = "Wykresy Wiolinowe zmiennych ilościowych")
+```
+
+Z wykresów wiolinowych widać, że rozkłady bez uwzględnienia gatunku i płci nie są normalne – wręcz są nie-jednomodalne.
+
+### Wykresy Pudełkowe (Box-Plots)
+
+```{r boxplot-plain, fig.height=8}
+ggplot(df_long, aes(x = variable, y = value)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank()) +
+  labs(title = "Box-Ploty zmiennych ilościowych")
+```
+
+---
+
+## Zmienne Jakościowe
+
+### Histogram z podziałem na gatunek
+
+```{r hist-species}
+ggplot(df_long, aes(x = value, fill = Species)) +
+  geom_histogram(bins = 25, position = "dodge", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Histogramy wg gatunku (Species)")
+```
+
+Jasno widać podział na gatunek wśród zmiennych ilościowych.
+
+### Histogram z podziałem na płeć
+
+```{r hist-sex}
+ggplot(df_long, aes(x = value, fill = Sex)) +
+  geom_histogram(bins = 25, position = "dodge", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Histogramy wg płci (Sex)")
+```
+
+Widać przesunięcie rozkładu między płciami.
+
+### Dystrybuanty Empiryczne wg płci
+
+```{r ecdf-sex}
+ggplot(df_long, aes(x = value, color = Sex)) +
+  stat_ecdf() +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(title = "ECDF wg płci")
+```
+
+### Dystrybuanty Empiryczne wg gatunku
+
+```{r ecdf-species}
+ggplot(df_long, aes(x = value, color = Species)) +
+  stat_ecdf() +
+  facet_wrap(~variable, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(title = "ECDF wg gatunku")
+```
+
+### Violin Plots wg gatunku i płci
+
+```{r violin-species-sex, fig.height=10}
+for (num_var in numerical_variables) {
+  p <- ggplot(df, aes(x = Species, y = .data[[num_var]], fill = Sex)) +
+    geom_violin(position = position_dodge(0.8), alpha = 0.7) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank()) +
+    labs(title = paste("Violin plot:", num_var, "wg gatunku i płci"))
+  print(p)
+}
+```
+
+### Box-Plots wg gatunku i płci
+
+```{r boxplot-species-sex, fig.height=10}
+for (num_var in numerical_variables) {
+  p <- ggplot(df, aes(x = Species, y = .data[[num_var]], fill = Sex)) +
+    geom_boxplot(position = position_dodge(0.8), alpha = 0.7) +
+    theme_minimal() +
+    labs(title = paste("Box-plot:", num_var, "wg gatunku i płci"))
+  print(p)
+}
+```
+
+---
+
+# Estymacja Parametrów, Przedziały Ufności, Testy na zgodność z rozkładem
+
+```{r dist-helpers}
+# Dopasowanie rozkładów: normalny, logistyczny
+fit_distributions <- function(x) {
+  list(
+    norm     = MASS::fitdistr(x, "normal"),
+    logistic = MASS::fitdistr(x, "logistic")
+  )
+}
+
+# Bootstrap CI dla parametrów (BCa)
+bootstrap_ci <- function(x, stat_fn, R = 999, conf = 0.95) {
+  b <- boot::boot(x, statistic = function(d, i) stat_fn(d[i]), R = R)
+  ci <- boot::boot.ci(b, type = "bca", conf = conf)
+  list(est = b$t0, low = ci$bca[4], high = ci$bca[5], dist = b$t)
+}
+```
+
+## Przed podziałem względem gatunku
+
+### Estymacja parametrów i Przedziały Ufności
+
+```{r fit-all, fig.height=20}
+library(MASS)
+
+stats_list <- list()
+
+par(mfrow = c(length(numerical_variables), 1), mar = c(4,4,3,1))
+
+for (num_var in numerical_variables) {
+  x <- na.omit(df[[num_var]])
+
+  fits <- fit_distributions(x)
+
+  # Histogram + dopasowane gęstości
+  p <- ggplot(data.frame(x = x), aes(x = x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 25,
+                   fill = "steelblue", color = "white", alpha = 0.6) +
+    stat_function(fun = dnorm,
+                  args = list(mean = fits$norm$estimate["mean"],
+                              sd   = fits$norm$estimate["sd"]),
+                  aes(color = "norm"), linewidth = 0.9) +
+    stat_function(fun = dlogis,
+                  args = list(location = fits$logistic$estimate["location"],
+                              scale    = fits$logistic$estimate["scale"]),
+                  aes(color = "logistic"), linewidth = 0.9) +
+    labs(title = num_var, color = "Rozkład") +
+    theme_minimal()
+  print(p)
+
+  # Bootstrap CI dla każdego parametru
+  row <- c()
+
+  # norm: mean, sd
+  ci_mean <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "normal")$estimate["mean"])
+  ci_sd   <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "normal")$estimate["sd"])
+  ci_loc  <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "logistic")$estimate["location"])
+  ci_scl  <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "logistic")$estimate["scale"])
+
+  stats_list[[num_var]] <- list(
+    norm_mu     = ci_mean$est, norm_mu_low     = ci_mean$low, norm_mu_high     = ci_mean$high,
+    norm_std    = ci_sd$est,   norm_std_low    = ci_sd$low,   norm_std_high    = ci_sd$high,
+    logistic_loc= ci_loc$est,  logistic_loc_low= ci_loc$low,  logistic_loc_high= ci_loc$high,
+    logistic_scl= ci_scl$est,  logistic_scl_low= ci_scl$low,  logistic_scl_high= ci_scl$high,
+    boot_norm_mu   = ci_mean$dist,
+    boot_norm_std  = ci_sd$dist,
+    boot_logistic_loc = ci_loc$dist,
+    boot_logistic_scl = ci_scl$dist
+  )
+}
+```
+
+```{r stats-table}
+# Tabela parametrów bez kolumn bootstrap
+stats_df <- map_dfr(stats_list, function(s) {
+  as.data.frame(s[!startsWith(names(s), "boot")])
+}, .id = "variable")
+
+stats_df
+```
+
+### Rozkłady Bootstrap (Przedziały Ufności)
+
+```{r bootstrap-plots, fig.height=30}
+for (num_var in numerical_variables) {
+  s <- stats_list[[num_var]]
+
+  params <- list(
+    list(name = "norm_mu",        dist = s$boot_norm_mu,
+         est  = s$norm_mu,        low = s$norm_mu_low,        high = s$norm_mu_high),
+    list(name = "norm_std",       dist = s$boot_norm_std,
+         est  = s$norm_std,       low = s$norm_std_low,       high = s$norm_std_high),
+    list(name = "logistic_loc",   dist = s$boot_logistic_loc,
+         est  = s$logistic_loc,   low = s$logistic_loc_low,   high = s$logistic_loc_high),
+    list(name = "logistic_scl",   dist = s$boot_logistic_scl,
+         est  = s$logistic_scl,   low = s$logistic_scl_low,   high = s$logistic_scl_high)
+  )
+
+  plots <- lapply(params, function(p) {
+    ggplot(data.frame(x = p$dist), aes(x = x)) +
+      geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.7) +
+      geom_vline(xintercept = p$est, color = "orange", linewidth = 1) +
+      annotate("rect",
+               xmin = p$low, xmax = p$high,
+               ymin = -Inf,  ymax = Inf,
+               fill = "orange", alpha = 0.2) +
+      labs(title = paste(num_var, "\n", p$name)) +
+      theme_minimal() +
+      theme(panel.grid.minor = element_blank())
+  })
+
+  print(wrap_plots(plots, ncol = 5))
+}
+```
+
+---
+
+### Testy Zgodności z rozkładem
+
+```{r gof-helper}
+library(nortest)
+
+goodness_of_fit_tests <- function(df_sub, dists, stats_df) {
+  rows <- list()
+
+  for (num_var in numerical_variables) {
+    x <- na.omit(df_sub[[num_var]])
+
+    # norm
+    mu  <- stats_df[stats_df$variable == num_var, "norm_mu"]
+    std <- stats_df[stats_df$variable == num_var, "norm_std"]
+    ks_norm  <- ks.test(x, "pnorm",  mean = mu, sd = std)$p.value
+    ad_norm  <- nortest::ad.test((x - mu) / std)$p.value
+
+    # logistic
+    loc <- stats_df[stats_df$variable == num_var, "logistic_loc"]
+    scl <- stats_df[stats_df$variable == num_var, "logistic_scl"]
+    ks_log   <- ks.test(x, "plogis", location = loc, scale = scl)$p.value
+    ad_log   <- nortest::ad.test(plogis(x, location = loc, scale = scl))$p.value
+
+    rows[[length(rows)+1]] <- data.frame(
+      variable     = rep(num_var, 2),
+      dist         = c("norm", "logistic"),
+      kstest_p     = round(c(ks_norm, ks_log), 4),
+      ad_p         = round(c(ad_norm, ad_log), 4),
+      reject_ks    = c(ks_norm, ks_log) < 0.05,
+      reject_ad    = c(ad_norm, ad_log) < 0.05
+    )
+  }
+
+  do.call(rbind, rows)
+}
+```
+
+```{r gof-all}
+gof_all <- goodness_of_fit_tests(df, list(), stats_df)
+gof_all
+```
+
+Testy zgodności sugerują, że hipoteza zerowa (rozkład pochodzi z `norm`, `logistic`) została odrzucona w prawie każdym przypadku.
+
+---
+
+## Po Podziale na gatunek
+
+```{r per-species, fig.height=20}
+test_specie <- function(specie_type) {
+  df_s <- df %>% filter(Species == specie_type)
+
+  stats_s <- list()
+  for (num_var in numerical_variables) {
+    x <- na.omit(df_s[[num_var]])
+    fits <- fit_distributions(x)
+
+    ci_mean <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "normal")$estimate["mean"])
+    ci_sd   <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "normal")$estimate["sd"])
+    ci_loc  <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "logistic")$estimate["location"])
+    ci_scl  <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "logistic")$estimate["scale"])
+
+    stats_s[[num_var]] <- list(
+      norm_mu=ci_mean$est, norm_mu_low=ci_mean$low, norm_mu_high=ci_mean$high,
+      norm_std=ci_sd$est,  norm_std_low=ci_sd$low,  norm_std_high=ci_sd$high,
+      logistic_loc=ci_loc$est, logistic_loc_low=ci_loc$low, logistic_loc_high=ci_loc$high,
+      logistic_scl=ci_scl$est, logistic_scl_low=ci_scl$low, logistic_scl_high=ci_scl$high,
+      boot_norm_mu=ci_mean$dist, boot_norm_std=ci_sd$dist,
+      boot_logistic_loc=ci_loc$dist, boot_logistic_scl=ci_scl$dist
+    )
+  }
+
+  stats_df_s <- map_dfr(stats_s, function(s) {
+    as.data.frame(s[!startsWith(names(s), "boot")])
+  }, .id = "variable")
+
+  # Wykresy dopasowania
+  for (num_var in numerical_variables) {
+    x <- na.omit(df_s[[num_var]])
+    f <- fit_distributions(x)
+    p <- ggplot(data.frame(x=x), aes(x=x)) +
+      geom_histogram(aes(y=after_stat(density)), bins=25,
+                     fill="steelblue", color="white", alpha=0.6) +
+      stat_function(fun=dnorm, args=list(mean=f$norm$estimate["mean"], sd=f$norm$estimate["sd"]), aes(color="norm"), linewidth=0.9) +
+      stat_function(fun=dlogis, args=list(location=f$logistic$estimate["location"], scale=f$logistic$estimate["scale"]), aes(color="logistic"), linewidth=0.9) +
+      labs(title=paste(specie_type, "-", num_var), color="Rozkład") +
+      theme_minimal()
+    print(p)
+  }
+
+  # Testy
+  gof <- goodness_of_fit_tests(df_s, list(), stats_df_s)
+
+  list(stats = stats_df_s, gof = gof, bootstrap = stats_s)
+}
+```
+
+#### Adelie
+
+```{r adelie, fig.height=20}
+res_adelie <- test_specie("Adelie")
+res_adelie$stats
+res_adelie$gof
+```
+
+Rozkład wykładniczy zostaje zdecydowanie odrzucony. Najlepiej dopasowane: rozkład logistyczny i normalny.
+
+#### Chinstrap
+
+```{r chinstrap, fig.height=20}
+res_chinstrap <- test_specie("Chinstrap")
+res_chinstrap$stats
+res_chinstrap$gof
+```
+
+Najlepiej dopasowuje się rozkład normalny, następnie logistyczny.
+
+#### Gentoo
+
+```{r gentoo, fig.height=20}
+res_gentoo <- test_specie("Gentoo")
+res_gentoo$stats
+res_gentoo$gof
+```
+
+Rozkład wykładniczy odrzucony; pozostałe sprawują się różnie.
+
+---
+
+## Podział ze względu na płeć i gatunek
+
+```{r sex-species-gof}
+all_types <- expand.grid(
+  Species = unique(df$Species),
+  Sex     = unique(df$Sex),
+  stringsAsFactors = FALSE
+)
+all_types
+
+result_summary <- list()
+
+for (i in seq_len(nrow(all_types))) {
+  sp  <- all_types$Species[i]
+  sex <- all_types$Sex[i]
+
+  df_sub <- df %>% filter(Species == sp, Sex == sex)
+
+  stats_sub <- list()
+  for (num_var in numerical_variables) {
+    x <- na.omit(df_sub[[num_var]])
+    if (length(x) < 10) next
+
+    ci_mean <- bootstrap_ci(x, function(d) MASS::fitdistr(d,"normal")$estimate["mean"])
+    ci_sd   <- bootstrap_ci(x, function(d) MASS::fitdistr(d,"normal")$estimate["sd"])
+    ci_loc  <- bootstrap_ci(x, function(d) MASS::fitdistr(d,"logistic")$estimate["location"])
+    ci_scl  <- bootstrap_ci(x, function(d) MASS::fitdistr(d,"logistic")$estimate["scale"])
+
+    stats_sub[[num_var]] <- list(
+      norm_mu=ci_mean$est, norm_mu_low=ci_mean$low, norm_mu_high=ci_mean$high,
+      norm_std=ci_sd$est,  norm_std_low=ci_sd$low,  norm_std_high=ci_sd$high,
+      logistic_loc=ci_loc$est, logistic_loc_low=ci_loc$low, logistic_loc_high=ci_loc$high,
+      logistic_scl=ci_scl$est, logistic_scl_low=ci_scl$low, logistic_scl_high=ci_scl$high
+    )
+  }
+
+  stats_df_sub <- map_dfr(stats_sub, function(s) as.data.frame(s), .id = "variable")
+  gof_sub      <- goodness_of_fit_tests(df_sub, list(), stats_df_sub)
+
+  group_name <- paste0(sp, "-", sex)
+
+  result_summary[[group_name]] <- c(
+    setNames(
+      sapply(c("norm","logistic"), function(d)
+        sum(!gof_sub[gof_sub$dist==d, "reject_ks"])),
+      paste0("[", c("norm","logistic"), "] Kolmogorov: H0 not rejected")
+    ),
+    setNames(
+      sapply(c("norm","logistic"), function(d)
+        sum(!gof_sub[gof_sub$dist==d, "reject_ad"])),
+      paste0("[", c("norm","logistic"), "] Anderson: H0 not rejected")
+    )
+  )
+}
+
+as.data.frame(result_summary)
+```
+
+Z wyników widać, że najlepiej zadziałało dopasowanie do rozkładu normalnego.
+
+---
+
+# Testy na niezależność, korelacje
+
+## Chi-Squared dla zmiennych jakościowych
+
+```{r chi-squared}
+chi_sq_matrix <- function(df, cat_vars) {
+  m <- matrix(NA, nrow = length(cat_vars), ncol = length(cat_vars),
+              dimnames = list(cat_vars, cat_vars))
+  for (v1 in cat_vars)
+    for (v2 in cat_vars)
+      m[v1, v2] <- round(chisq.test(table(df[[v1]], df[[v2]]))$p.value, 3)
+  m
+}
+
+chi_mat <- chi_sq_matrix(df, categorical_variables)
+
+corrplot(
+  chi_mat,
+  method  = "color",
+  col     = colorRampPalette(c("blue","white","red"))(200),
+  addCoef.col = "black",
+  tl.col  = "black",
+  title   = "Chi-squared p-values (zmienne jakościowe)",
+  mar     = c(0,0,2,0),
+  is.corr = FALSE
+)
+```
+
+p-values dla zmiennych jakościowych (macierz symetryczna):
+
+**Zależne:** Species–Island, Species–Clutch Completion, Island–Clutch Completion
+
+**Niezależne:** Sex–Species, Sex–Island, Sex–Clutch Completion
+
+---
+
+## ANOVA & Kruskal-Wallis
+
+```{r anova}
+library(dplyr)
+
+examine_anova <- function(df, num_vars, cat_vars) {
+  rows <- list()
+  for (cat_var in cat_vars) {
+    for (num_var in num_vars) {
+      groups    <- split(na.omit(df[[num_var]]), df[[cat_var]])
+      residuals <- unlist(lapply(groups, function(g) g - mean(g)))
+
+      rows[[length(rows)+1]] <- data.frame(
+        categorical       = cat_var,
+        numerical         = num_var,
+        shapiro_p         = round(shapiro.test(residuals)$p.value, 3),
+        normaltest_p      = round(nortest::ad.test(residuals)$p.value, 3),
+        levene_p          = round(car::leveneTest(df[[num_var]] ~ as.factor(df[[cat_var]]))$`Pr(>F)`[1], 3),
+        fligner_p         = round(fligner.test(df[[num_var]], as.factor(df[[cat_var]]))$p.value, 3),
+        kruskal_p         = round(kruskal.test(df[[num_var]] ~ as.factor(df[[cat_var]]))$p.value, 3),
+        anova_p           = round(summary(aov(df[[num_var]] ~ as.factor(df[[cat_var]])))[[1]]$`Pr(>F)`[1], 3)
+      )
+    }
+  }
+  do.call(rbind, rows)
+}
+
+anova_df <- examine_anova(df, numerical_variables, categorical_variables)
+anova_df
+```
+
+```{r kruskal-summary}
+# Kruskal – macierz p-values
+# kruskal-summary
+anova_df %>%
+  dplyr::select(categorical, numerical, kruskal_p) %>%
+  pivot_wider(names_from = numerical, values_from = kruskal_p)
+```
+
+```{r anova-summary}
+# ANOVA – tylko dla grup spełniających założenia (shapiro, normaltest, levene, fligner > 0.05)
+# anova-summary
+anova_df %>%
+  dplyr::filter(shapiro_p > 0.05, normaltest_p > 0.05, levene_p > 0.05, fligner_p > 0.05) %>%
+  dplyr::select(categorical, numerical, anova_p) %>%
+  pivot_wider(names_from = numerical, values_from = anova_p)
+```
+
+---
+
+## Korelacje Spearmana
+
+### Bez podziału na gatunek i płeć
+
+```{r spearman-all}
+spearman_matrices <- function(df, num_vars) {
+  n   <- length(num_vars)
+  r_m <- matrix(NA, n, n, dimnames = list(num_vars, num_vars))
+  p_m <- matrix(NA, n, n, dimnames = list(num_vars, num_vars))
+
+  for (v1 in num_vars)
+    for (v2 in num_vars) {
+      res        <- cor.test(df[[v1]], df[[v2]], method = "spearman", exact = FALSE)
+      r_m[v1,v2] <- round(res$estimate, 3)
+      p_m[v1,v2] <- round(res$p.value,  3)
+    }
+  list(r = r_m, p = p_m)
+}
+
+sp <- spearman_matrices(df, numerical_variables)
+```
+
+```{r spearman-p-heatmap}
+corrplot(sp$p, method = "color",
+         col = colorRampPalette(c("blue","white","red"))(200),
+         addCoef.col = "black", tl.col = "black",
+         title = "Spearman p-values (wszystkie dane)", mar = c(0,0,2,0),
+         is.corr = FALSE)
+```
+
+H₀ przyjęta tylko dla `Culmen Length (mm)` vs `Delta 15 N (o/oo)`.
+
+```{r spearman-r-heatmap}
+corrplot(sp$r, method = "color",
+         col = colorRampPalette(c("blue","white","red"))(200),
+         addCoef.col = "black", tl.col = "black",
+         title = "Spearman r (wszystkie dane)", mar = c(0,0,2,0))
+```
+
+---
+
+### Z podziałem na gatunek i płeć
+
+```{r spearman-per-group, fig.height=24, fig.width=20}
+species_levels <- unique(df$Species)
+sex_levels     <- unique(df$Sex)
+
+plot_heatmap_grid <- function(type = "p") {
+  plot_list <- list()
+
+  for (sp_name in species_levels) {
+    for (sex_name in sex_levels) {
+      df_sub <- df %>% filter(Species == sp_name, Sex == sex_name)
+      mat    <- spearman_matrices(df_sub, numerical_variables)
+      m      <- if (type == "p") mat$p else mat$r
+
+      df_heat <- as.data.frame(m) %>%
+        rownames_to_column("var1") %>%
+        pivot_longer(-var1, names_to = "var2", values_to = "val")
+
+      center_val <- if (type == "p") 0.05 else 0
+      lim        <- if (type == "p") c(0,1)   else c(-1,1)
+
+      p <- ggplot(df_heat, aes(x = var2, y = var1, fill = val)) +
+        geom_tile() +
+        geom_text(aes(label = round(val, 2)), size = 2.5) +
+        scale_fill_gradient2(
+          low = "blue", mid = "white", high = "red",
+          midpoint = center_val, limits = lim
+        ) +
+        labs(title = paste(sp_name, sex_name), x = NULL, y = NULL) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 15, hjust = 1, size = 7),
+              axis.text.y = element_text(size = 7))
+
+      plot_list[[paste(sp_name, sex_name)]] <- p
+    }
+  }
+  wrap_plots(plot_list, nrow = length(species_levels))
+}
+
+plot_heatmap_grid("p")
+```
+
+p-values po rozdzieleniu per gatunek i płeć.
+
+```{r spearman-r-grid, fig.height=24, fig.width=20}
+plot_heatmap_grid("r")
+```
