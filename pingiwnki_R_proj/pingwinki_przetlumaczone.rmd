@@ -1,4 +1,4 @@
-# ---
+---
 title: "Analiza Pingwinów Palmer Archipelago"
 output:
   html_document:
@@ -6,6 +6,8 @@ output:
     toc_depth: 3
     toc_float: true
     theme: flatly
+    code_folding: hide
+  slidy_presentation: default
 ---
 
 Dane: [Palmer Archipelago Antarctica Penguin Data (Kaggle)](https://www.kaggle.com/datasets/parulpandey/palmer-archipelago-antarctica-penguin-data)
@@ -92,7 +94,7 @@ numerical_variables <- c(
 ### Bonus: Wykresy Kropkowe (z KDE)
 
 ```{r pairplots, fig.height=10, fig.width=10}
-for (cat_var in categorical_variables) {
+for (cat_var in c("Species", "Sex")) {
   p <- ggpairs(
     df %>% select(all_of(numerical_variables), all_of(cat_var)),
     aes(color = .data[[cat_var]], alpha = 0.6),
@@ -215,7 +217,7 @@ ggplot(df_long, aes(x = value, color = Species)) +
 
 ### Violin Plots wg gatunku i płci
 
-```{r violin-species-sex, fig.height=10}
+```{r violin-species-sex, fig.height=4}
 for (num_var in numerical_variables) {
   p <- ggplot(df, aes(x = Species, y = .data[[num_var]], fill = Sex)) +
     geom_violin(position = position_dodge(0.8), alpha = 0.7) +
@@ -228,7 +230,7 @@ for (num_var in numerical_variables) {
 
 ### Box-Plots wg gatunku i płci
 
-```{r boxplot-species-sex, fig.height=10}
+```{r boxplot-species-sex, fig.height=4}
 for (num_var in numerical_variables) {
   p <- ggplot(df, aes(x = Species, y = .data[[num_var]], fill = Sex)) +
     geom_boxplot(position = position_dodge(0.8), alpha = 0.7) +
@@ -263,7 +265,7 @@ bootstrap_ci <- function(x, stat_fn, R = 999, conf = 0.95) {
 
 ### Estymacja parametrów i Przedziały Ufności
 
-```{r fit-all, fig.height=20}
+```{r fit-all, fig.height=3}
 library(MASS)
 
 stats_list <- list()
@@ -324,7 +326,7 @@ stats_df
 
 ### Rozkłady Bootstrap (Przedziały Ufności)
 
-```{r bootstrap-plots, fig.height=30}
+```{r bootstrap-plots, fig.height=3}
 for (num_var in numerical_variables) {
   s <- stats_list[[num_var]]
 
@@ -401,89 +403,6 @@ gof_all
 ```
 
 Testy zgodności sugerują, że hipoteza zerowa (rozkład pochodzi z `norm`, `logistic`) została odrzucona w prawie każdym przypadku.
-
----
-
-## Po Podziale na gatunek
-
-```{r per-species, fig.height=20}
-test_specie <- function(specie_type) {
-  df_s <- df %>% filter(Species == specie_type)
-
-  stats_s <- list()
-  for (num_var in numerical_variables) {
-    x <- na.omit(df_s[[num_var]])
-    fits <- fit_distributions(x)
-
-    ci_mean <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "normal")$estimate["mean"])
-    ci_sd   <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "normal")$estimate["sd"])
-    ci_loc  <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "logistic")$estimate["location"])
-    ci_scl  <- bootstrap_ci(x, function(d) MASS::fitdistr(d, "logistic")$estimate["scale"])
-
-    stats_s[[num_var]] <- list(
-      norm_mu=ci_mean$est, norm_mu_low=ci_mean$low, norm_mu_high=ci_mean$high,
-      norm_std=ci_sd$est,  norm_std_low=ci_sd$low,  norm_std_high=ci_sd$high,
-      logistic_loc=ci_loc$est, logistic_loc_low=ci_loc$low, logistic_loc_high=ci_loc$high,
-      logistic_scl=ci_scl$est, logistic_scl_low=ci_scl$low, logistic_scl_high=ci_scl$high,
-      boot_norm_mu=ci_mean$dist, boot_norm_std=ci_sd$dist,
-      boot_logistic_loc=ci_loc$dist, boot_logistic_scl=ci_scl$dist
-    )
-  }
-
-  stats_df_s <- map_dfr(stats_s, function(s) {
-    as.data.frame(s[!startsWith(names(s), "boot")])
-  }, .id = "variable")
-
-  # Wykresy dopasowania
-  for (num_var in numerical_variables) {
-    x <- na.omit(df_s[[num_var]])
-    f <- fit_distributions(x)
-    p <- ggplot(data.frame(x=x), aes(x=x)) +
-      geom_histogram(aes(y=after_stat(density)), bins=25,
-                     fill="steelblue", color="white", alpha=0.6) +
-      stat_function(fun=dnorm, args=list(mean=f$norm$estimate["mean"], sd=f$norm$estimate["sd"]), aes(color="norm"), linewidth=0.9) +
-      stat_function(fun=dlogis, args=list(location=f$logistic$estimate["location"], scale=f$logistic$estimate["scale"]), aes(color="logistic"), linewidth=0.9) +
-      labs(title=paste(specie_type, "-", num_var), color="Rozkład") +
-      theme_minimal()
-    print(p)
-  }
-
-  # Testy
-  gof <- goodness_of_fit_tests(df_s, list(), stats_df_s)
-
-  list(stats = stats_df_s, gof = gof, bootstrap = stats_s)
-}
-```
-
-#### Adelie
-
-```{r adelie, fig.height=20}
-res_adelie <- test_specie("Adelie")
-res_adelie$stats
-res_adelie$gof
-```
-
-Rozkład wykładniczy zostaje zdecydowanie odrzucony. Najlepiej dopasowane: rozkład logistyczny i normalny.
-
-#### Chinstrap
-
-```{r chinstrap, fig.height=20}
-res_chinstrap <- test_specie("Chinstrap")
-res_chinstrap$stats
-res_chinstrap$gof
-```
-
-Najlepiej dopasowuje się rozkład normalny, następnie logistyczny.
-
-#### Gentoo
-
-```{r gentoo, fig.height=20}
-res_gentoo <- test_specie("Gentoo")
-res_gentoo$stats
-res_gentoo$gof
-```
-
-Rozkład wykładniczy odrzucony; pozostałe sprawują się różnie.
 
 ---
 
